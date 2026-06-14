@@ -1,30 +1,35 @@
 import 'package:flutter/material.dart';
 import 'package:bitsdojo_window/bitsdojo_window.dart';
+import 'dart:async';
+import 'package:screen_retriever/screen_retriever.dart';
+import 'state_manager.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:http/http.dart' as http;
 import 'package:audioplayers/audioplayers.dart';
 import 'dart:convert';
-
-// Replace with your actual ElevenLabs API Key and preferred Voice ID
-const String elevenLabsApiKey = 'sk_973f55501039964bb0986afbb53fc86fc47d2fdd55f305dc';
-const String elevenLabsVoiceId = 'pNInz6obpgDQGcFmaJcg'; // Example: Adam/Rachel
+import 'settings_service.dart';
+import 'gemini_service.dart';
 
 class ElevenLabsService {
   final AudioPlayer _audioPlayer = AudioPlayer();
+  final SettingsService _settingsService = SettingsService();
 
   Future<void> speak(String text) async {
-    if (elevenLabsApiKey.isEmpty || elevenLabsApiKey == 'YOUR_ELEVENLABS_API_KEY') {
+    final apiKey = await _settingsService.getElevenLabsKey();
+    final voiceId = await _settingsService.getElevenLabsVoiceId();
+
+    if (apiKey == null || apiKey.isEmpty || apiKey == 'YOUR_ELEVENLABS_API_KEY') {
       debugPrint('Please set your ElevenLabs API Key.');
       return;
     }
 
-    final url = Uri.parse('https://api.elevenlabs.io/v1/text-to-speech/$elevenLabsVoiceId');
+    final url = Uri.parse('https://api.elevenlabs.io/v1/text-to-speech/$voiceId');
     try {
       final response = await http.post(
         url,
         headers: {
           'Accept': 'audio/mpeg',
-          'xi-api-key': elevenLabsApiKey,
+          'xi-api-key': apiKey,
           'Content-Type': 'application/json',
         },
         body: jsonEncode({
@@ -55,7 +60,7 @@ void main() async {
   await windowManager.ensureInitialized();
 
   WindowOptions windowOptions = const WindowOptions(
-    size: Size(300, 450),
+    size: Size(350, 500),
     center: true,
     backgroundColor: Colors.transparent,
     skipTaskbar: false,
@@ -70,11 +75,16 @@ void main() async {
 
   runApp(const AssistantApp());
 
-  doWhenWindowReady(() {
+  doWhenWindowReady(() async {
     final win = appWindow;
-    win.minSize = const Size(300, 450);
-    win.size = const Size(300, 450);
-    win.alignment = Alignment.bottomRight;
+    win.minSize = const Size(350, 500);
+    win.size = const Size(350, 500);
+    
+    // Accurately position window right above the taskbar
+    Display primaryDisplay = await screenRetriever.getPrimaryDisplay();
+    double right = primaryDisplay.visiblePosition!.dx + primaryDisplay.visibleSize!.width;
+    double bottom = primaryDisplay.visiblePosition!.dy + primaryDisplay.visibleSize!.height;
+    win.position = Offset(right - 350, bottom - 500);
     win.show();
   });
 }
@@ -102,33 +112,161 @@ class AssistantHome extends StatefulWidget {
   State<AssistantHome> createState() => _AssistantHomeState();
 }
 
-class _AssistantHomeState extends State<AssistantHome> {
+
+
+class _AssistantHomeState extends State<AssistantHome> with SingleTickerProviderStateMixin {
   final ElevenLabsService _ttsService = ElevenLabsService();
+  final GeminiService _geminiService = GeminiService();
+  final SettingsService _settingsService = SettingsService();
+
   String _message = "Waiting for notifications...";
-  bool _isJumping = false;
+  bool _showChatInput = false;
+  bool _isExpanded = false;
+  
+  AssistantState _currentState = AssistantState.idle;
 
-  void _simulateNotification() async {
-    setState(() {
-      _message = "You got a new email!";
-      _isJumping = true;
-    });
+  final TextEditingController _chatController = TextEditingController();
 
-    _ttsService.speak("You got a new email, Santhosh!");
+  late AnimationController _breatheController;
+  late Animation<double> _breatheAnimation;
+  
+  Timer? _cursorTimer;
+  Offset _cursorPos = Offset.zero;
+  Offset _windowCenter = Offset.zero;
 
-    // Stop jumping animation after 1 second
-    Future.delayed(const Duration(seconds: 1), () {
-      if (mounted) {
+  @override
+  void initState() {
+    super.initState();
+    _initGemini();
+    
+    _breatheController = AnimationController(
+      vsync: this,
+      duration: const Duration(seconds: 2),
+    )..repeat(reverse: true);
+    
+    _breatheAnimation = Tween<double>(begin: 1.0, end: 1.05).animate(
+      CurvedAnimation(parent: _breatheController, curve: Curves.easeInOut),
+    );
+    
+    _startCursorTracking();
+  }
+
+  void _startCursorTracking() {
+    _cursorTimer = Timer.periodic(const Duration(milliseconds: 30), (timer) async {
+      Offset pos = await screenRetriever.getCursorScreenPoint();
+      Rect windowRect = await windowManager.getBounds();
+      
+      Offset center = Offset(
+        windowRect.left + (windowRect.width / 2),
+        windowRect.top + (windowRect.height / 2),
+      );
+
+      if (mounted && (_cursorPos != pos || _windowCenter != center)) {
         setState(() {
-          _isJumping = false;
+          _cursorPos = pos;
+          _windowCenter = center;
         });
       }
     });
-    
-    // Clear message after 4 seconds
-    Future.delayed(const Duration(seconds: 4), () {
+  }
+
+  @override
+  void dispose() {
+    _cursorTimer?.cancel();
+    _breatheController.dispose();
+    _chatController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _initGemini() async {
+    final key = await _settingsService.getGeminiKey();
+    if (key != null && key.isNotEmpty) {
+      await _geminiService.initialize(key);
+    }
+  }
+
+  void _openSettings() {
+    final geminiController = TextEditingController();
+    final elevenLabsController = TextEditingController();
+    final voiceIdController = TextEditingController();
+
+    _settingsService.getGeminiKey().then((val) => geminiController.text = val ?? '');
+    _settingsService.getElevenLabsKey().then((val) => elevenLabsController.text = val ?? '');
+    _settingsService.getElevenLabsVoiceId().then((val) => voiceIdController.text = val ?? '');
+
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text("Settings"),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextField(
+                  controller: geminiController,
+                  decoration: const InputDecoration(labelText: "Gemini API Key"),
+                ),
+                TextField(
+                  controller: elevenLabsController,
+                  decoration: const InputDecoration(labelText: "ElevenLabs API Key"),
+                ),
+                TextField(
+                  controller: voiceIdController,
+                  decoration: const InputDecoration(labelText: "Voice ID"),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Cancel"),
+            ),
+            ElevatedButton(
+              onPressed: () async {
+                await _settingsService.saveGeminiKey(geminiController.text);
+                await _settingsService.saveElevenLabsKey(elevenLabsController.text);
+                await _settingsService.saveElevenLabsVoiceId(voiceIdController.text);
+                await _initGemini(); // re-init
+                if (!context.mounted) return;
+                Navigator.pop(context);
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('Settings saved!')),
+                );
+              },
+              child: const Text("Save"),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _sendMessage() async {
+    final text = _chatController.text.trim();
+    if (text.isEmpty) return;
+
+    _chatController.clear();
+    setState(() {
+      _showChatInput = false;
+      _message = "Thinking...";
+      _currentState = AssistantState.thinking;
+    });
+
+    final response = await _geminiService.sendMessage(text);
+
+    setState(() {
+      _message = response;
+      _currentState = AssistantState.speaking;
+    });
+
+    _ttsService.speak(response);
+
+    Future.delayed(const Duration(seconds: 3), () {
       if (mounted) {
         setState(() {
-          _message = "Waiting for notifications...";
+          _currentState = AssistantState.idle;
         });
       }
     });
@@ -136,6 +274,15 @@ class _AssistantHomeState extends State<AssistantHome> {
 
   @override
   Widget build(BuildContext context) {
+    // Calculate 3D Parallax Tilt based on cursor
+    double deltaX = _cursorPos.dx - _windowCenter.dx;
+    double deltaY = _cursorPos.dy - _windowCenter.dy;
+    
+    // Normalize and clamp
+    double maxTilt = 0.5; // radians
+    double tiltX = (deltaY / 1000).clamp(-maxTilt, maxTilt);
+    double tiltY = (-deltaX / 1000).clamp(-maxTilt, maxTilt);
+
     return Scaffold(
       backgroundColor: Colors.transparent,
       body: GestureDetector(
@@ -148,59 +295,145 @@ class _AssistantHomeState extends State<AssistantHome> {
             mainAxisAlignment: MainAxisAlignment.end,
             children: [
               // Message Bubble
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-                decoration: BoxDecoration(
-                  color: Colors.white.withValues(alpha: 0.9),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: Colors.blueAccent.withValues(alpha: 0.3)),
-                ),
-                child: Text(
-                  _message,
-                  style: const TextStyle(fontSize: 14, color: Colors.black87),
-                  textAlign: TextAlign.center,
-                ),
-              ),
-              const SizedBox(height: 10),
-              
-              // Character
-              AnimatedContainer(
-                duration: const Duration(milliseconds: 300),
-                transform: Matrix4.translationValues(0, _isJumping ? -20 : 0, 0),
-                child: Container(
-                  width: 150,
-                  height: 150,
+              if (_message.isNotEmpty)
+                Container(
+                  margin: const EdgeInsets.only(bottom: 10, left: 20, right: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
                   decoration: BoxDecoration(
-                    color: Colors.blueAccent.withValues(alpha: 0.8),
-                    shape: BoxShape.circle,
+                    color: Colors.white.withAlpha(230),
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: Colors.amber.withAlpha(100)),
                     boxShadow: [
                       BoxShadow(
-                        color: Colors.blue.withValues(alpha: 0.5),
-                        blurRadius: 20,
-                        spreadRadius: 10,
+                        color: Colors.black.withAlpha(20),
+                        blurRadius: 10,
                       )
                     ]
                   ),
-                  child: Center(
-                    child: Text(
-                      _isJumping ? '(^‿^)' : '(◕‿◕)',
-                      style: const TextStyle(fontSize: 40, color: Colors.white),
+                  child: Text(
+                    _message,
+                    style: const TextStyle(fontSize: 14, color: Colors.black87),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              
+              // Character (Minion Placeholder)
+              GestureDetector(
+                onTap: () {
+                  setState(() {
+                    _isExpanded = !_isExpanded;
+                    if (!_isExpanded) _showChatInput = false;
+                  });
+                },
+                child: ScaleTransition(
+                  scale: _breatheAnimation,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 100),
+                    // Small jump when speaking, slight float when thinking
+                    transform: Matrix4.translationValues(
+                      0, 
+                      _currentState == AssistantState.speaking ? -15 : (_currentState == AssistantState.thinking ? -5 : 0), 
+                      0
+                    ),
+                    child: Transform(
+                      alignment: FractionalOffset.center,
+                      transform: Matrix4.identity()
+                        ..setEntry(3, 2, 0.001) // perspective
+                        ..rotateX(tiltX)
+                        ..rotateY(tiltY),
+                      child: SizedBox(
+                        width: 120,
+                        height: 140,
+                        child: Image.asset(
+                          'assets/minion.gif',
+                          fit: BoxFit.contain,
+                          errorBuilder: (context, error, stackTrace) {
+                            return const Icon(Icons.person, size: 80, color: Colors.yellow);
+                          },
+                        ),
+                      ),
                     ),
                   ),
                 ),
               ),
-              const SizedBox(height: 10),
-              
-              // Mock Notification Trigger
-              ElevatedButton(
-                onPressed: _simulateNotification,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.blueAccent,
-                  foregroundColor: Colors.white,
-                  shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+              const SizedBox(height: 15),
+
+              // Action Buttons
+              if (_isExpanded)
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    // Chat Button
+                    GestureDetector(
+                      onTap: () {
+                        setState(() {
+                          _showChatInput = !_showChatInput;
+                        });
+                      },
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withAlpha(200),
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(color: Colors.black.withAlpha(20), blurRadius: 5)
+                          ],
+                        ),
+                        child: const Icon(Icons.chat_bubble_outline, color: Colors.blueAccent),
+                      ),
+                    ),
+                    const SizedBox(width: 20),
+                    // Settings Button
+                    GestureDetector(
+                      onTap: _openSettings,
+                      child: Container(
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.white.withAlpha(200),
+                          shape: BoxShape.circle,
+                          boxShadow: [
+                            BoxShadow(color: Colors.black.withAlpha(20), blurRadius: 5)
+                          ],
+                        ),
+                        child: const Icon(Icons.settings_outlined, color: Colors.grey),
+                      ),
+                    ),
+                  ],
                 ),
-                child: const Text('Simulate Notification'),
-              ),
+              
+              // Chat Input Field
+              if (_isExpanded && _showChatInput) ...[
+                const SizedBox(height: 15),
+                Container(
+                  margin: const EdgeInsets.symmetric(horizontal: 20),
+                  padding: const EdgeInsets.symmetric(horizontal: 10),
+                  decoration: BoxDecoration(
+                    color: Colors.white,
+                    borderRadius: BorderRadius.circular(20),
+                    boxShadow: [
+                      BoxShadow(color: Colors.black.withAlpha(20), blurRadius: 5)
+                    ],
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: TextField(
+                          controller: _chatController,
+                          decoration: const InputDecoration(
+                            hintText: 'Talk to Gemini...',
+                            border: InputBorder.none,
+                          ),
+                          onSubmitted: (_) => _sendMessage(),
+                        ),
+                      ),
+                      IconButton(
+                        icon: const Icon(Icons.send, color: Colors.blueAccent),
+                        onPressed: _sendMessage,
+                      ),
+                    ],
+                  ),
+                ),
+              ],
               const SizedBox(height: 20),
             ],
           ),
