@@ -20,15 +20,9 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update daily log
-        run: |
-          DATE=$(date +'%Y-%m-%d %H:%M:%S')
-          echo "- Automated daily system update and progress log: $DATE" >> DAILY_LOG.md
-
       - name: Commit and push changes
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add DAILY_LOG.md
-          git commit -m "Automated daily system update and progress log: $(date +'%Y-%m-%d %H:%M:%S')"
+          git commit --allow-empty -m "Automated daily activity log: $(date +'%Y-%m-%d %H:%M:%S')"
           git push
